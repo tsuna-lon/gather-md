@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import time
 import yaml
@@ -42,10 +43,18 @@ COMMENT_PLACEHOLDER_PATTERN = re.compile(
 # Mustache置換パターン: {{tag}} (改行や波括弧を含まない任意の文字列)
 MUSTACHE_PLACEHOLDER_PATTERN = re.compile(r"\{\{([^\{\}\r\n]+?)\}\}")
 
+# 誤編集防止用警告バナー（Obsidian Callout記法対応）
+WARNING_BANNER = (
+    "> [!CAUTION]\n"
+    "> **【自動生成ファイル】直接編集しないでください**\n"
+    "> このファイルは下書きから自動集約されています。直接編集した内容は次回更新時に上書きされます。\n\n"
+)
 
 # デフォルトテンプレート内容（新規フォルダ作成時の自動生成用）
 DEFAULT_TEMPLATE_CONTENT = """---
 output: "_完成レポート.md"
+readonly: true
+warning_banner: true
 ---
 # {title} レポート
 
@@ -72,6 +81,26 @@ class ProjectConfig:
     output_file: Path
     template_content: str
     template_file: Path | None = None
+    readonly: bool = True
+    warning_banner: bool = True
+
+
+def set_file_writable(file_path: Path) -> None:
+    """ファイルの書き込み権限を付与する（読み取り専用属性を解除）。"""
+    if file_path.exists():
+        try:
+            os.chmod(file_path, stat.S_IWRITE | stat.S_IREAD)
+        except Exception as e:
+            print(f"[警告] ファイル書き込み権限の付与に失敗しました ({file_path}): {e}", flush=True)
+
+
+def set_file_readonly(file_path: Path) -> None:
+    """ファイルを読み取り専用に設定する。"""
+    if file_path.exists():
+        try:
+            os.chmod(file_path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+        except Exception as e:
+            print(f"[警告] 読み取り専用属性の設定に失敗しました ({file_path}): {e}", flush=True)
 
 
 def parse_frontmatter(content: str) -> tuple[dict, str]:
@@ -100,6 +129,9 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                 output_name = data.get("output", "_完成レポート.md")
                 output_file = (dir_path / output_name).resolve()
 
+                readonly = data.get("readonly", True)
+                warning_banner = data.get("warning_banner", True)
+
                 template_content = data.get("template")
                 template_file = None
 
@@ -123,6 +155,8 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                     output_file=output_file,
                     template_content=template_content,
                     template_file=template_file,
+                    readonly=bool(readonly),
+                    warning_banner=bool(warning_banner),
                 )
             except Exception as e:
                 print(f"[エラー] 設定ファイル読み込みエラー ({cfg_path}): {e}", flush=True)
@@ -138,12 +172,17 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                 output_name = frontmatter.get("output", "_完成レポート.md")
                 output_file = (dir_path / output_name).resolve()
 
+                readonly = frontmatter.get("readonly", True)
+                warning_banner = frontmatter.get("warning_banner", True)
+
                 return ProjectConfig(
                     project_dir=dir_path.resolve(),
                     config_file=t_path.resolve(),
                     output_file=output_file,
                     template_content=body,
                     template_file=t_path.resolve(),
+                    readonly=bool(readonly),
+                    warning_banner=bool(warning_banner),
                 )
             except Exception as e:
                 print(f"[エラー] テンプレートファイル読み込みエラー ({t_path}): {e}", flush=True)
@@ -365,7 +404,11 @@ def generate_report(config: ProjectConfig) -> bool:
     merged = re.sub(r"<!--\s*CHAR_COUNT\s*-->", f"{count_no_spaces:,}", merged)
     merged = re.sub(r"<!--\s*CHAR_COUNT_WITH_SPACES\s*-->", f"{count_with_spaces:,}", merged)
 
-    # 5. 既存ファイルとの差分チェック & 書き込み
+    # 5. 誤編集防止警告バナーの挿入（文字数カウント集計の後に付与し、集計対象から除外）
+    if config.warning_banner:
+        merged = WARNING_BANNER + merged
+
+    # 6. 既存ファイルとの差分チェック & 書き込み
     need_write = True
     if config.output_file.exists():
         try:
@@ -378,7 +421,14 @@ def generate_report(config: ProjectConfig) -> bool:
     if need_write:
         try:
             config.output_file.parent.mkdir(parents=True, exist_ok=True)
+            # 既存の読み取り専用属性を一時解除して書き込み
+            set_file_writable(config.output_file)
             config.output_file.write_text(merged, encoding="utf-8")
+
+            # 読み取り専用保護を適用
+            if config.readonly:
+                set_file_readonly(config.output_file)
+
             print(
                 f"[{time.strftime('%H:%M:%S')}] [{config.project_dir.name}] "
                 f"更新完了 -> {config.output_file.name} "
@@ -387,9 +437,15 @@ def generate_report(config: ProjectConfig) -> bool:
             )
             return True
         except Exception as e:
+            # 失敗時も可能な限り読み取り専用保護を再適用
+            if config.readonly:
+                set_file_readonly(config.output_file)
             print(f"[エラー] ファイル書き込み失敗 ({config.output_file}): {e}", flush=True)
             return False
     else:
+        # 差分がなくても読み取り専用保護が外れていれば再適用
+        if config.readonly:
+            set_file_readonly(config.output_file)
         return False
 
 
