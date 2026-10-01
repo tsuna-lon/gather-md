@@ -14,6 +14,7 @@ from gather_md import (
     extract_blocks,
     calculate_character_counts,
     generate_report,
+    create_default_template_if_needed,
 )
 
 
@@ -143,6 +144,84 @@ template: |
         # 文字数カウントが入っているか
         self.assertRegex(out_content, r"\(文字数: \d+字 / 空白込: \d+字\)")
         print("\n--- 生成結果プレビュー ---\n" + out_content)
+
+    def test_create_default_template_on_root_dir(self):
+        """直下の新規ディレクトリ作成時にテンプレートが自動生成されること"""
+        new_proj = self.test_dir / "課題1 - 情報社会論"
+        new_proj.mkdir()
+
+        res = create_default_template_if_needed(new_proj, root_dir=self.test_dir)
+        self.assertIsNotNone(res)
+        template_file = new_proj / "_template.md"
+        self.assertTrue(template_file.is_file())
+
+        content = template_file.read_text(encoding="utf-8")
+        self.assertIn('# 課題1 - 情報社会論 レポート', content)
+        self.assertIn('output: "_完成レポート.md"', content)
+        self.assertIn('<!-- INSERT:１．はじめに -->', content)
+        self.assertIn('{{char_count}}', content)
+
+        # 初期レポートも生成されていること
+        output_file = new_proj / "_完成レポート.md"
+        self.assertTrue(output_file.is_file())
+
+    def test_ignore_subdirectory(self):
+        """サブディレクトリ（2階層目以降）が作成された場合はテンプレート生成を行わないこと"""
+        parent_proj = self.test_dir / "課題2"
+        parent_proj.mkdir()
+        # 親にはテンプレートを作成
+        create_default_template_if_needed(parent_proj, root_dir=self.test_dir)
+
+        # サブディレクトリを作成
+        sub_dir = parent_proj / "下書き_第1章"
+        sub_dir.mkdir()
+
+        res = create_default_template_if_needed(sub_dir, root_dir=self.test_dir)
+        self.assertIsNone(res)
+        self.assertFalse((sub_dir / "_template.md").exists())
+
+    def test_ignore_hidden_and_cache_directories(self):
+        """隠しフォルダやキャッシュフォルダは無視すること"""
+        obsidian_dir = self.test_dir / ".obsidian"
+        obsidian_dir.mkdir()
+        res1 = create_default_template_if_needed(obsidian_dir, root_dir=self.test_dir)
+        self.assertIsNone(res1)
+        self.assertFalse((obsidian_dir / "_template.md").exists())
+
+        pycache_dir = self.test_dir / "__pycache__"
+        pycache_dir.mkdir()
+        res2 = create_default_template_if_needed(pycache_dir, root_dir=self.test_dir)
+        self.assertIsNone(res2)
+        self.assertFalse((pycache_dir / "_template.md").exists())
+
+    def test_hold_temporary_windows_folder_name(self):
+        """「新しいフォルダー」等のWindows初期名称では保留され、リネーム後に生成されること"""
+        temp_dir = self.test_dir / "新しいフォルダー"
+        temp_dir.mkdir()
+
+        # 一時名の間は保留される
+        res = create_default_template_if_needed(temp_dir, root_dir=self.test_dir)
+        self.assertIsNone(res)
+        self.assertFalse((temp_dir / "_template.md").exists())
+
+        # リネーム後
+        renamed_dir = self.test_dir / "課題3 - 経済学"
+        temp_dir.rename(renamed_dir)
+
+        res_renamed = create_default_template_if_needed(renamed_dir, root_dir=self.test_dir)
+        self.assertIsNotNone(res_renamed)
+        self.assertTrue((renamed_dir / "_template.md").exists())
+
+    def test_do_not_overwrite_existing_template_or_config(self):
+        """既存のテンプレートや設定ファイルが存在する場合は上書きしないこと"""
+        custom_proj = self.test_dir / "課題4"
+        custom_proj.mkdir()
+        existing_template = custom_proj / "_template.md"
+        existing_template.write_text("カスタムテンプレート", encoding="utf-8")
+
+        res = create_default_template_if_needed(custom_proj, root_dir=self.test_dir)
+        self.assertIsNone(res)
+        self.assertEqual(existing_template.read_text(encoding="utf-8"), "カスタムテンプレート")
 
 
 if __name__ == "__main__":

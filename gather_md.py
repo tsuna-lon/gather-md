@@ -43,6 +43,26 @@ COMMENT_PLACEHOLDER_PATTERN = re.compile(
 MUSTACHE_PLACEHOLDER_PATTERN = re.compile(r"\{\{([^\{\}\r\n]+?)\}\}")
 
 
+# デフォルトテンプレート内容（新規フォルダ作成時の自動生成用）
+DEFAULT_TEMPLATE_CONTENT = """---
+output: "_完成レポート.md"
+---
+# {title} レポート
+
+<!-- INSERT:１．はじめに -->
+
+<!-- INSERT:２．背景と課題 -->
+
+<!-- INSERT:３．今後の展望 -->
+
+---
+文字数: {{char_count}} 字（空白含: {{char_count_with_spaces}} 字）
+"""
+
+# Windowsの一時フォルダ名パターン（エクスプローラー新規作成時の「新しいフォルダー」等）
+TEMP_DIR_PATTERN = re.compile(r"^(新しいフォルダー|新規フォルダー|New folder)( \(\d+\))?$", re.IGNORECASE)
+
+
 @dataclass
 class ProjectConfig:
     project_dir: Path
@@ -172,6 +192,66 @@ def find_all_projects(root_dir: Path = WATCH_ROOT) -> list[ProjectConfig]:
             seen_dirs.add(d_res)
 
     return projects
+
+
+def create_default_template_if_needed(dir_path: Path, root_dir: Path = WATCH_ROOT) -> Path | None:
+    """
+    指定ディレクトリが監視ルート直下の新規プロジェクトの場合に、初期テンプレート(_template.md)を自動生成する。
+    - 直下以外のサブディレクトリ（2階層目以降）は対象外
+    - 隠しディレクトリ（.obsidianなど）やキャッシュディレクトリ（__pycache__）は除外
+    - エクスプローラー新規作成時の一時フォルダー名（「新しいフォルダー」等）はリネーム確定まで保留
+    - 既存の設定ファイルやテンプレートファイルが存在する場合は上書き防止のためスキップ
+    """
+    try:
+        resolved_dir = dir_path.resolve()
+        resolved_root = root_dir.resolve()
+    except Exception:
+        return None
+
+    # 1. ディレクトリの存在確認
+    if not resolved_dir.is_dir():
+        return None
+
+    # 2. 監視ルートの直下（第1階層）であるかを判定（親ディレクトリがWATCH_ROOTと一致）
+    if resolved_dir.parent != resolved_root:
+        return None
+
+    # 3. 隠しフォルダやキャッシュフォルダは除外
+    dir_name = resolved_dir.name
+    if dir_name.startswith(".") or dir_name in ("__pycache__",):
+        return None
+
+    # 4. Windowsエクスプローラーの一時的なフォルダー名（新しいフォルダー等）はリネームまで保留
+    if TEMP_DIR_PATTERN.match(dir_name):
+        return None
+
+    # 5. 上書き防止: 既存の定義ファイルまたはテンプレートファイルが存在するか確認
+    existing_config = load_project_config(resolved_dir)
+    if existing_config is not None:
+        return None
+
+    # 念のため _template.md 自身の存在もチェック
+    template_path = resolved_dir / "_template.md"
+    if template_path.exists():
+        return None
+
+    # 6. _template.md を生成
+    content = DEFAULT_TEMPLATE_CONTENT.replace("{title}", dir_name)
+    try:
+        template_path.write_text(content, encoding="utf-8")
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [{dir_name}] "
+            f"初期テンプレートを自動生成しました -> {template_path.name}",
+            flush=True,
+        )
+        # 初期レポートの自動生成
+        cfg = load_project_config(resolved_dir)
+        if cfg:
+            generate_report(cfg)
+        return template_path
+    except Exception as e:
+        print(f"[エラー] テンプレート自動生成に失敗しました ({template_path}): {e}", flush=True)
+        return None
 
 
 def extract_blocks(project_dir: Path, exclude_paths: set[Path]) -> dict[str, str]:
@@ -365,8 +445,16 @@ class ReportChangeHandler(FileSystemEventHandler):
             self._handle_event(event.src_path)
 
     def on_created(self, event):
-        if not event.is_directory:
+        if event.is_directory:
+            create_default_template_if_needed(Path(event.src_path))
+        else:
             self._handle_event(event.src_path)
+
+    def on_moved(self, event):
+        if event.is_directory:
+            create_default_template_if_needed(Path(event.dest_path))
+        else:
+            self._handle_event(event.dest_path)
 
     def on_deleted(self, event):
         if not event.is_directory:
