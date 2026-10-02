@@ -47,14 +47,15 @@ MUSTACHE_PLACEHOLDER_PATTERN = re.compile(r"\{\{([^\{\}\r\n]+?)\}\}")
 WARNING_BANNER = (
     "> [!CAUTION]\n"
     "> **【自動生成ファイル】直接編集しないでください**\n"
-    "> このファイルは下書きから自動集約されています。直接編集した内容は次回更新時に上書きされます。\n\n"
+    "> このファイルは下書きから自動集約されています。直接編集した内容は自動復元（ロールバック）または次回更新時に上書きされます。\n\n"
 )
 
 # デフォルトテンプレート内容（新規フォルダ作成時の自動生成用）
 DEFAULT_TEMPLATE_CONTENT = """---
 output: "_完成レポート.md"
-readonly: true
+readonly: false
 warning_banner: true
+auto_rollback: true
 ---
 # {title} レポート
 
@@ -81,8 +82,9 @@ class ProjectConfig:
     output_file: Path
     template_content: str
     template_file: Path | None = None
-    readonly: bool = True
+    readonly: bool = False
     warning_banner: bool = True
+    auto_rollback: bool = True
 
 
 def set_file_writable(file_path: Path) -> None:
@@ -129,8 +131,9 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                 output_name = data.get("output", "_完成レポート.md")
                 output_file = (dir_path / output_name).resolve()
 
-                readonly = data.get("readonly", True)
+                readonly = data.get("readonly", False)
                 warning_banner = data.get("warning_banner", True)
+                auto_rollback = data.get("auto_rollback", True)
 
                 template_content = data.get("template")
                 template_file = None
@@ -157,6 +160,7 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                     template_file=template_file,
                     readonly=bool(readonly),
                     warning_banner=bool(warning_banner),
+                    auto_rollback=bool(auto_rollback),
                 )
             except Exception as e:
                 print(f"[エラー] 設定ファイル読み込みエラー ({cfg_path}): {e}", flush=True)
@@ -172,8 +176,9 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                 output_name = frontmatter.get("output", "_完成レポート.md")
                 output_file = (dir_path / output_name).resolve()
 
-                readonly = frontmatter.get("readonly", True)
+                readonly = frontmatter.get("readonly", False)
                 warning_banner = frontmatter.get("warning_banner", True)
+                auto_rollback = frontmatter.get("auto_rollback", True)
 
                 return ProjectConfig(
                     project_dir=dir_path.resolve(),
@@ -183,6 +188,7 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                     template_file=t_path.resolve(),
                     readonly=bool(readonly),
                     warning_banner=bool(warning_banner),
+                    auto_rollback=bool(auto_rollback),
                 )
             except Exception as e:
                 print(f"[エラー] テンプレートファイル読み込みエラー ({t_path}): {e}", flush=True)
@@ -348,8 +354,8 @@ def calculate_character_counts(text: str) -> tuple[int, int]:
     return count_no_spaces, count_with_spaces
 
 
-def generate_report(config: ProjectConfig) -> bool:
-    """テンプレートと下書きブロックをマージして完成レポートを出力する。"""
+def build_report_content(config: ProjectConfig) -> tuple[str, int, int] | None:
+    """テンプレートと下書きブロックから完成レポートの内容と文字数を生成する。"""
     exclude_paths = {config.output_file.resolve(), config.config_file.resolve()}
     if config.template_file:
         exclude_paths.add(config.template_file.resolve())
@@ -359,8 +365,7 @@ def generate_report(config: ProjectConfig) -> bool:
 
     template = config.template_content
     if not template:
-        print(f"[{time.strftime('%H:%M:%S')}] テンプレートが空のため出力をスキップします: {config.project_dir.name}", flush=True)
-        return False
+        return None
 
     # 2. HTMLコメント形式のプレースホルダー置換
     # <!-- INSERT:tag --> または <!-- INSERT:tag -->...<!-- END:tag -->
@@ -408,7 +413,19 @@ def generate_report(config: ProjectConfig) -> bool:
     if config.warning_banner:
         merged = WARNING_BANNER + merged
 
-    # 6. 既存ファイルとの差分チェック & 書き込み
+    return merged, count_no_spaces, count_with_spaces
+
+
+def generate_report(config: ProjectConfig) -> bool:
+    """テンプレートと下書きブロックをマージして完成レポートを出力する。"""
+    res = build_report_content(config)
+    if res is None:
+        print(f"[{time.strftime('%H:%M:%S')}] テンプレートが空のため出力をスキップします: {config.project_dir.name}", flush=True)
+        return False
+
+    merged, count_no_spaces, count_with_spaces = res
+
+    # 既存ファイルとの差分チェック & 書き込み
     need_write = True
     if config.output_file.exists():
         try:
@@ -425,9 +442,11 @@ def generate_report(config: ProjectConfig) -> bool:
             set_file_writable(config.output_file)
             config.output_file.write_text(merged, encoding="utf-8")
 
-            # 読み取り専用保護を適用
+            # 読み取り専用属性の同期
             if config.readonly:
                 set_file_readonly(config.output_file)
+            else:
+                set_file_writable(config.output_file)
 
             print(
                 f"[{time.strftime('%H:%M:%S')}] [{config.project_dir.name}] "
@@ -437,15 +456,60 @@ def generate_report(config: ProjectConfig) -> bool:
             )
             return True
         except Exception as e:
-            # 失敗時も可能な限り読み取り専用保護を再適用
             if config.readonly:
                 set_file_readonly(config.output_file)
             print(f"[エラー] ファイル書き込み失敗 ({config.output_file}): {e}", flush=True)
             return False
     else:
-        # 差分がなくても読み取り専用保護が外れていれば再適用
+        # 差分がなくても、設定に合わせて読み取り専用属性を同期
         if config.readonly:
             set_file_readonly(config.output_file)
+        else:
+            set_file_writable(config.output_file)
+        return False
+
+
+def rollback_report(config: ProjectConfig) -> bool:
+    """完成レポートが直接変更された場合に、下書きとテンプレートから自動復元（ロールバック）する。"""
+    if not config.output_file.exists():
+        return False
+
+    res = build_report_content(config)
+    if res is None:
+        return False
+
+    merged, count_no_spaces, count_with_spaces = res
+
+    try:
+        existing = config.output_file.read_text(encoding="utf-8")
+    except Exception:
+        existing = None
+
+    # 内容が異なる場合のみロールバックを実行
+    if existing != merged:
+        try:
+            set_file_writable(config.output_file)
+            config.output_file.write_text(merged, encoding="utf-8")
+            if config.readonly:
+                set_file_readonly(config.output_file)
+            else:
+                set_file_writable(config.output_file)
+
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [{config.project_dir.name}] "
+                f"直接編集を検知しました。下書きから自動復元（ロールバック）しました -> {config.output_file.name}",
+                flush=True
+            )
+            return True
+        except Exception as e:
+            print(f"[エラー] 自動復元（ロールバック）に失敗しました ({config.output_file}): {e}", flush=True)
+            return False
+    else:
+        # 差分がない場合も属性を同期
+        if config.readonly:
+            set_file_readonly(config.output_file)
+        else:
+            set_file_writable(config.output_file)
         return False
 
 
@@ -491,8 +555,10 @@ class ReportChangeHandler(FileSystemEventHandler):
         if config is None:
             return
 
-        # 出力ファイル自身の変更イベントなら無限ループ防止のためスキップ
+        # 出力ファイル自身の変更イベントの場合（直接編集検知と自動復元）
         if path.resolve() == config.output_file.resolve():
+            if config.auto_rollback:
+                rollback_report(config)
             return
 
         # レポートを更新

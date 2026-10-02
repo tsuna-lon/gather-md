@@ -17,8 +17,10 @@ from gather_md import (
     extract_blocks,
     calculate_character_counts,
     generate_report,
+    rollback_report,
     create_default_template_if_needed,
     set_file_writable,
+    set_file_readonly,
     WARNING_BANNER,
 )
 
@@ -170,8 +172,9 @@ template: |
         content = template_file.read_text(encoding="utf-8")
         self.assertIn('# 課題1 - 情報社会論 レポート', content)
         self.assertIn('output: "_完成レポート.md"', content)
-        self.assertIn('readonly: true', content)
+        self.assertIn('readonly: false', content)
         self.assertIn('warning_banner: true', content)
+        self.assertIn('auto_rollback: true', content)
         self.assertIn('{{１．はじめに}}', content)
         self.assertIn('{{char_count}}', content)
 
@@ -370,6 +373,89 @@ template: |
                 f.write("\n手動追記")
         except PermissionError:
             self.fail("readonly: false なのに PermissionError が発生しました")
+
+    def test_auto_rollback_on_direct_edit(self):
+        """完成レポートが直接編集された場合、下書きから自動復元（ロールバック）されること"""
+        proj_dir = self.test_dir / "project_rollback"
+        proj_dir.mkdir()
+        config_path = proj_dir / "_template.md"
+        config_path.write_text(
+            """---
+output: "_完成レポート.md"
+readonly: false
+warning_banner: true
+auto_rollback: true
+---
+# 課題レポート
+{{sec1}}
+""",
+            encoding="utf-8",
+        )
+        draft = proj_dir / "draft.md"
+        draft.write_text("```report: sec1\n正規の下書き本文です。\n```", encoding="utf-8")
+
+        cfg = load_project_config(proj_dir)
+        self.assertIsNotNone(cfg)
+        self.assertTrue(cfg.auto_rollback)
+
+        # 1. 正常なレポート生成
+        self.assertTrue(generate_report(cfg))
+        original_content = cfg.output_file.read_text(encoding="utf-8")
+        self.assertIn("正規の下書き本文です。", original_content)
+
+        # 2. 外部で直接編集（誤編集）を実行
+        with open(cfg.output_file, "w", encoding="utf-8") as f:
+            f.write("# 誤って直接編集した内容")
+
+        # 3. ロールバック実行
+        rolled_back = rollback_report(cfg)
+        self.assertTrue(rolled_back)
+
+        # 4. 内容が正規の内容に復元されていること
+        restored_content = cfg.output_file.read_text(encoding="utf-8")
+        self.assertEqual(restored_content, original_content)
+        self.assertNotIn("誤って直接編集した内容", restored_content)
+
+        # 5. 差分がない状態で再度ロールバックを呼んだ場合は False となり不要な再書き込みが行われないこと
+        self.assertFalse(rollback_report(cfg))
+
+    def test_unlock_existing_readonly_file(self):
+        """既存ファイルが読み取り専用になっていても、readonly: false で自動的に書き込み可能に解除されること"""
+        proj_dir = self.test_dir / "project_unlock"
+        proj_dir.mkdir()
+        out_file = proj_dir / "_完成レポート.md"
+        out_file.write_text("古い内容", encoding="utf-8")
+        set_file_readonly(out_file)
+
+        # 読み取り専用になっていることを確認
+        with self.assertRaises(PermissionError):
+            with open(out_file, "w", encoding="utf-8") as f:
+                f.write("書き込めないはず")
+
+        # readonly: false の設定でレポート生成を実行
+        config_path = proj_dir / "_template.md"
+        config_path.write_text(
+            """---
+output: "_完成レポート.md"
+readonly: false
+---
+# 新しいレポート
+""",
+            encoding="utf-8",
+        )
+        cfg = load_project_config(proj_dir)
+        self.assertIsNotNone(cfg)
+        self.assertFalse(cfg.readonly)
+
+        # 生成により上書きされ、読み取り専用属性が解除される
+        self.assertTrue(generate_report(cfg))
+
+        # 書き込み権限が回復していること
+        try:
+            with open(out_file, "a", encoding="utf-8") as f:
+                f.write("\n追記可能")
+        except PermissionError:
+            self.fail("読み取り専用属性が解除されていません")
 
 
 if __name__ == "__main__":
