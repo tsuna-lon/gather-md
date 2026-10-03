@@ -30,9 +30,12 @@ WATCH_ROOT = Path(__file__).resolve().parent
 CONFIG_FILENAMES = ["report_config.yaml", "report_config.yml", "_report.yaml", "_report.yml"]
 TEMPLATE_FILENAMES = ["_template.md", "report_template.md"]
 
-# コードブロック抽出正規表現: ```report:<tag>\n...\n``` または ```report: <tag>\n...\n```
+# コードブロック抽出正規表現: ```report:<tag>\n...\n``` または ```report: <tag>\n...\n```（中身が空のブロックも許容）
 # 日本語（全角数字・記号含む）や英数字など柔軟に対応
-BLOCK_PATTERN = re.compile(r"```report:\s*([^\r\n]+?)\s*\r?\n(.*?)\r?\n```", re.DOTALL)
+BLOCK_PATTERN = re.compile(
+    r"```report:\s*([^\r\n]+?)\s*(?:\r?\n```|\r?\n(.*?)\r?\n```)",
+    re.DOTALL
+)
 
 # コメント置換パターン: <!-- INSERT:tag --> ... <!-- END:tag --> または <!-- INSERT:tag -->
 COMMENT_PLACEHOLDER_PATTERN = re.compile(
@@ -324,7 +327,7 @@ def extract_blocks(project_dir: Path, exclude_paths: set[Path]) -> dict[str, str
                 tag_clean = tag.strip()
                 if tag_clean in blocks:
                     print(f"  [注意] タグ '{tag_clean}' が重複しています ({md_file.name} で上書き)", flush=True)
-                blocks[tag_clean] = text.strip()
+                blocks[tag_clean] = (text or "").strip()
         except Exception as e:
             print(f"  [警告] ファイル読み込みスキップ ({md_file.name}): {e}", flush=True)
             continue
@@ -335,13 +338,15 @@ def extract_blocks(project_dir: Path, exclude_paths: set[Path]) -> dict[str, str
 def calculate_character_counts(text: str) -> tuple[int, int]:
     """
     テキストの文字数を集計する。
-    - コメントタグ（<!-- ... -->）は集計から除外。
+    - コメントタグ（<!-- ... -->）および未作成・未記入ラベル（【未作成: ...】, 【未記入: ...】）は集計から除外。
     戻り値: (空白除外文字数, 空白含む文字数)
     """
     # HTMLコメントタグを除去
     no_comments = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    # 未作成・未記入ラベルを除去
+    no_labels = re.sub(r"【(?:未作成|未記入):[^】\r\n]*?】", "", no_comments)
     # 改行コードを正規化
-    normalized = no_comments.replace("\r\n", "\n")
+    normalized = no_labels.replace("\r\n", "\n")
 
     # 空白・改行をすべて除外した純文字数
     no_spaces = re.sub(r"\s+", "", normalized)
@@ -375,11 +380,13 @@ def build_report_content(config: ProjectConfig) -> tuple[str, int, int] | None:
         if tag.lower() in ("char_count", "char_count_with_spaces", "char_count_raw"):
             return match.group(0)
 
-        if tag in blocks:
+        if tag not in blocks:
+            return f"<!-- INSERT:{tag} -->\n【未作成: {tag}】\n<!-- END:{tag} -->"
+        elif not blocks[tag].strip():
+            return f"<!-- INSERT:{tag} -->\n【未記入: {tag}】\n<!-- END:{tag} -->"
+        else:
             body = blocks[tag]
             return f"<!-- INSERT:{tag} -->\n{body}\n<!-- END:{tag} -->"
-        else:
-            return f"<!-- INSERT:{tag} -->\n【未作成: {tag}】\n<!-- END:{tag} -->"
 
     merged = COMMENT_PLACEHOLDER_PATTERN.sub(replace_comment, template)
 
@@ -390,10 +397,12 @@ def build_report_content(config: ProjectConfig) -> tuple[str, int, int] | None:
         if tag in ("char_count", "char_count_with_spaces", "char_count_raw"):
             return match.group(0)
 
-        if tag in blocks:
-            return blocks[tag]
-        else:
+        if tag not in blocks:
             return f"【未作成: {tag}】"
+        elif not blocks[tag].strip():
+            return f"【未記入: {tag}】"
+        else:
+            return blocks[tag]
 
     merged = MUSTACHE_PLACEHOLDER_PATTERN.sub(replace_mustache, merged)
 

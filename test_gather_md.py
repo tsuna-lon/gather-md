@@ -457,6 +457,136 @@ readonly: false
         except PermissionError:
             self.fail("読み取り専用属性が解除されていません")
 
+    def test_empty_and_whitespace_block_handling(self):
+        """空ブロックや空白・改行のみのブロックが【未記入: タグ名】として処理され、タグ欠落時は【未作成: タグ名】になること"""
+        proj_dir = self.test_dir / "project_empty_blocks"
+        proj_dir.mkdir()
+        config_path = proj_dir / "report_config.yaml"
+        config_path.write_text(
+            """
+output: "out.md"
+warning_banner: false
+template: |
+  {{tag_missing}}
+  {{tag_empty}}
+  {{tag_whitespace}}
+  {{tag_normal}}
+  <!-- INSERT:tag_missing_comment -->
+  <!-- INSERT:tag_empty_comment -->
+  <!-- INSERT:tag_whitespace_comment -->
+  <!-- INSERT:tag_normal_comment -->
+""",
+            encoding="utf-8",
+        )
+        draft = proj_dir / "draft.md"
+        draft.write_text(
+            """
+```report: tag_empty
+```
+
+```report: tag_whitespace
+   \n  \t  \n
+```
+
+```report: tag_normal
+正常な本文です。
+```
+
+```report: tag_empty_comment
+```
+
+```report: tag_whitespace_comment
+\n\n   \n
+```
+
+```report: tag_normal_comment
+コメント形式の正常本文です。
+```
+""",
+            encoding="utf-8",
+        )
+
+        cfg = load_project_config(proj_dir)
+        self.assertIsNotNone(cfg)
+        self.assertTrue(generate_report(cfg))
+
+        content = cfg.output_file.read_text(encoding="utf-8")
+
+        # Mustache形式の検証
+        self.assertIn("【未作成: tag_missing】", content)
+        self.assertIn("【未記入: tag_empty】", content)
+        self.assertIn("【未記入: tag_whitespace】", content)
+        self.assertIn("正常な本文です。", content)
+
+        # コメント形式の検証
+        self.assertIn("<!-- INSERT:tag_missing_comment -->\n【未作成: tag_missing_comment】\n<!-- END:tag_missing_comment -->", content)
+        self.assertIn("<!-- INSERT:tag_empty_comment -->\n【未記入: tag_empty_comment】\n<!-- END:tag_empty_comment -->", content)
+        self.assertIn("<!-- INSERT:tag_whitespace_comment -->\n【未記入: tag_whitespace_comment】\n<!-- END:tag_whitespace_comment -->", content)
+        self.assertIn("<!-- INSERT:tag_normal_comment -->\nコメント形式の正常本文です。\n<!-- END:tag_normal_comment -->", content)
+
+    def test_labels_excluded_from_character_counts(self):
+        """【未作成: ...】および【未記入: ...】ラベルが文字数集計から完全に除外されること"""
+        # 1. calculate_character_counts 単体検証
+        text = "あいうえお【未作成: タグ1】かきくけこ【未記入: タグ2】\n<!-- コメント -->さしすせそ"
+        # 純文字数: "あいうえおかきくけこさしすせそ" = 15文字
+        no_spaces, with_spaces = calculate_character_counts(text)
+        self.assertEqual(no_spaces, 15)
+        self.assertEqual(with_spaces, 15)
+
+        # 2. レポート全体での検証: ラベルの有無で文字数カウントが変動しないこと
+        proj_dir = self.test_dir / "project_label_exclusion"
+        proj_dir.mkdir()
+        draft = proj_dir / "draft.md"
+        draft.write_text(
+            """
+```report: empty
+```
+```report: normal
+あいうえお
+```
+""",
+            encoding="utf-8",
+        )
+
+        config_path = proj_dir / "report_config.yaml"
+
+        # ラベルなし（normalのみ）で生成
+        config_path.write_text(
+            """
+output: "out_clean.md"
+warning_banner: false
+template: |
+  {{normal}}
+  文字数: {{char_count_raw}}
+""",
+            encoding="utf-8",
+        )
+        cfg_clean = load_project_config(proj_dir)
+        generate_report(cfg_clean)
+        content_clean = (proj_dir / "out_clean.md").read_text(encoding="utf-8")
+        count_clean = re.search(r"文字数:\s*(\d+)", content_clean).group(1)
+
+        # ラベルあり（未作成 missing, 未記入 empty を含む）で生成
+        config_path.write_text(
+            """
+output: "out_with_labels.md"
+warning_banner: false
+template: |
+  {{missing}}
+  {{empty}}
+  {{normal}}
+  文字数: {{char_count_raw}}
+""",
+            encoding="utf-8",
+        )
+        cfg_labels = load_project_config(proj_dir)
+        generate_report(cfg_labels)
+        content_labels = (proj_dir / "out_with_labels.md").read_text(encoding="utf-8")
+        count_labels = re.search(r"文字数:\s*(\d+)", content_labels).group(1)
+
+        # 未作成・未記入ラベルが存在しても、集計文字数が完全に一致すること
+        self.assertEqual(count_labels, count_clean)
+
 
 if __name__ == "__main__":
     unittest.main()
