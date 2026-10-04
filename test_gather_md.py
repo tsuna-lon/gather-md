@@ -22,6 +22,10 @@ from gather_md import (
     set_file_writable,
     set_file_readonly,
     WARNING_BANNER,
+    SingleInstance,
+    send_windows_toast,
+    find_obsidian_vault_name,
+    is_obsidian_vault_window_open,
 )
 
 
@@ -587,6 +591,79 @@ template: |
         # 未作成・未記入ラベルが存在しても、集計文字数が完全に一致すること
         self.assertEqual(count_labels, count_clean)
 
+    def test_single_instance_mutex(self):
+        """二重起動防止ミューテックスのテスト。"""
+        sub_dir = self.test_dir / "single_inst_test"
+        sub_dir.mkdir()
+
+        lock1 = SingleInstance(sub_dir)
+        acquired1 = lock1.acquire()
+        self.assertTrue(acquired1)
+        self.assertFalse(lock1.already_running)
+
+        # 同一パスで2つ目のインスタンス取得を試行 -> 失敗すること
+        lock2 = SingleInstance(sub_dir)
+        acquired2 = lock2.acquire()
+        self.assertFalse(acquired2)
+        self.assertTrue(lock2.already_running)
+
+        # 最初のロックを解放
+        lock1.release()
+
+        # 解放後は再取得できること
+        lock3 = SingleInstance(sub_dir)
+        acquired3 = lock3.acquire()
+        self.assertTrue(acquired3)
+        lock3.release()
+
+    def test_find_obsidian_vault_name(self):
+        """Obsidian Vault（書庫）名の特定テスト。"""
+        # 1. 親ディレクトリに .obsidian が存在する場合
+        vault_dir = self.test_dir / "MyVault"
+        vault_dir.mkdir()
+        (vault_dir / ".obsidian").mkdir()
+
+        project_dir = vault_dir / "Assignments" / "Task1"
+        project_dir.mkdir(parents=True)
+
+        found_name = find_obsidian_vault_name(project_dir)
+        self.assertEqual(found_name, "MyVault")
+
+        # 2. .obsidian がどこにも存在しない場合は自身のフォルダ名
+        no_vault_dir = self.test_dir / "StandaloneFolder"
+        no_vault_dir.mkdir()
+        self.assertEqual(find_obsidian_vault_name(no_vault_dir), "StandaloneFolder")
+
+    def test_is_obsidian_vault_window_open_matching(self):
+        """Obsidianウィンドウタイトルの判定テスト。"""
+        from unittest.mock import patch
+
+        vault_name = "ResearchNotes"
+
+        # パターン1: ノート名 - Vault名 - Obsidian vX.X.X
+        with patch("gather_md.get_obsidian_window_titles", return_value=["Introduction - ResearchNotes - Obsidian v1.5.8"]):
+            self.assertTrue(is_obsidian_vault_window_open(vault_name))
+
+        # パターン2: Vault名 - Obsidian vX.X.X (ノートを開いていないホーム画面等)
+        with patch("gather_md.get_obsidian_window_titles", return_value=["ResearchNotes - Obsidian v1.5.8"]):
+            self.assertTrue(is_obsidian_vault_window_open(vault_name))
+
+        # パターン3: 別書庫のウィンドウのみ開いている場合 -> False
+        with patch("gather_md.get_obsidian_window_titles", return_value=["Task - OtherVault - Obsidian v1.5.8"]):
+            self.assertFalse(is_obsidian_vault_window_open(vault_name))
+
+        # パターン4: ウィンドウなし
+        with patch("gather_md.get_obsidian_window_titles", return_value=[]):
+            self.assertFalse(is_obsidian_vault_window_open(vault_name))
+
+    def test_send_windows_toast_safety(self):
+        """Windowsトースト通知関数が例外を発生させず安全に完了することのテスト。"""
+        try:
+            send_windows_toast("テストタイトル", "テストメッセージ")
+        except Exception as e:
+            self.fail(f"send_windows_toast raised an unexpected exception: {e}")
+
 
 if __name__ == "__main__":
     unittest.main()
+

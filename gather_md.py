@@ -4,12 +4,18 @@ gather_md.py
 Markdownファイル内のコードブロックを抽出し、テンプレートに流し込んで完成レポートを自動生成・更新する。
 """
 
+import base64
+import csv
 from dataclasses import dataclass
+import hashlib
+import io
 import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
+import threading
 import time
 import yaml
 from watchdog.events import FileSystemEventHandler
@@ -76,6 +82,183 @@ auto_rollback: true
 
 # Windowsの一時フォルダ名パターン（エクスプローラー新規作成時の「新しいフォルダー」等）
 TEMP_DIR_PATTERN = re.compile(r"^(新しいフォルダー|新規フォルダー|New folder)( \(\d+\))?$", re.IGNORECASE)
+
+
+class SingleInstance:
+    """Windows Named Mutex を用いた二重起動防止クラス。"""
+
+    ERROR_ALREADY_EXISTS = 183
+
+    def __init__(self, root_path: Path):
+        self.root_path = root_path
+        self.mutex = None
+        self.already_running = False
+
+    def acquire(self) -> bool:
+        """ミューテックスの取得を試みる。既に起動している場合は False を返す。"""
+        if sys.platform != "win32":
+            return True
+        try:
+            import ctypes
+            path_hash = hashlib.sha256(str(self.root_path.resolve()).lower().encode("utf-8")).hexdigest()[:16]
+            mutex_name = f"Local\\gather_md_{path_hash}"
+            handle = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+            last_error = ctypes.windll.kernel32.GetLastError()
+            if last_error == self.ERROR_ALREADY_EXISTS:
+                self.already_running = True
+                if handle:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                return False
+            self.mutex = handle
+            return True
+        except Exception as e:
+            print(f"[警告] 二重起動防止ミューテックスの初期化に失敗しました: {e}", flush=True)
+            return True
+
+    def release(self) -> None:
+        """ミューテックスを解放する。"""
+        if sys.platform == "win32" and self.mutex:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.CloseHandle(self.mutex)
+            except Exception:
+                pass
+            self.mutex = None
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
+def send_windows_toast(title: str, message: str) -> None:
+    """Windowsトースト通知を非同期で送信する（標準ライブラリのみで完結）。"""
+    if sys.platform != "win32":
+        return
+
+    def _worker():
+        try:
+            def escape_xml(s: str) -> str:
+                return (
+                    s.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                    .replace('"', "&quot;")
+                    .replace("'", "&apos;")
+                )
+
+            safe_title = escape_xml(title)
+            safe_msg = escape_xml(message)
+
+            ps_script = f"""
+$ProgressPreference = 'SilentlyContinue'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>{safe_title}</text><text>{safe_msg}</text></binding></visual></toast>')
+$toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe').Show($toast)
+"""
+            encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+            subprocess.run(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+
+def find_obsidian_vault_name(start_dir: Path) -> str:
+    """指定ディレクトリから親ディレクトリを遡り、.obsidian が存在するディレクトリ（Vault名）を特定する。"""
+    current = start_dir.resolve()
+    while True:
+        if (current / ".obsidian").is_dir():
+            return current.name
+        if current.parent == current:
+            break
+        current = current.parent
+    return start_dir.name
+
+
+def get_obsidian_window_titles() -> list[str]:
+    """現在開いているObsidianのウィンドウタイトル一覧を取得する。"""
+    if sys.platform != "win32":
+        return []
+
+    # 1. まず高速な EnumWindows API を試みる（通常デスクトップで瞬時に判定可能）
+    titles: list[str] = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def enum_cb(hwnd, lparam):
+            if user32.IsWindowVisible(hwnd):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buff, length + 1)
+                    val = buff.value.strip()
+                    if val and "obsidian" in val.lower():
+                        titles.append(val)
+            return True
+
+        cb = WNDENUMPROC(enum_cb)
+        user32.EnumWindows(cb, 0)
+        if titles:
+            return titles
+    except Exception:
+        pass
+
+    # 2. EnumWindows で見つからない場合、tasklist から取得（別セッション・サンドボックスでも捕捉可能）
+    try:
+        raw = subprocess.check_output(
+            ["tasklist", "/v", "/fi", "IMAGENAME eq Obsidian.exe", "/fo", "csv"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        for enc in ("cp932", "utf-8", "shift_jis"):
+            try:
+                text = raw.decode(enc)
+                break
+            except Exception:
+                continue
+        else:
+            text = raw.decode("latin1", errors="replace")
+
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+        if len(rows) > 1:
+            for row in rows[1:]:
+                if len(row) >= 9:
+                    title = row[8].strip()
+                    if title and title not in ("N/A", "OleMainThreadWndName"):
+                        titles.append(title)
+        return titles
+    except Exception:
+        return []
+
+
+def is_obsidian_vault_window_open(vault_name: str) -> bool:
+    """指定されたVault名に対応するObsidianウィンドウが開いているか判定する。"""
+    titles = get_obsidian_window_titles()
+    for title in titles:
+        # Obsidianのウィンドウタイトル形式:
+        # "{ノート名} - {vault名} - Obsidian v1.x.x" または "{vault名} - Obsidian v1.x.x"
+        pattern = rf"(^| - ){re.escape(vault_name)} - Obsidian"
+        if re.search(pattern, title, re.IGNORECASE):
+            return True
+        if f"{vault_name} - Obsidian" in title:
+            return True
+    return False
 
 
 @dataclass
@@ -604,7 +787,33 @@ def main():
     print(f"監視ルート: {WATCH_ROOT}", flush=True)
     print("=" * 60, flush=True)
 
-    # 起動時に配下の全プロジェクトを検出して初回ビルドを実行
+    # 1. 二重起動防止チェック
+    instance_lock = SingleInstance(WATCH_ROOT)
+    if not instance_lock.acquire():
+        send_windows_toast("gather-md 警告", f"既に起動しているため終了しました ({WATCH_ROOT.name})")
+        print(f"\n[エラー] 既に同じディレクトリで gather-md が起動しています: {WATCH_ROOT}", flush=True)
+        sys.exit(1)
+
+    # 2. Obsidian 書庫（Vault）の特定と連動待機状態の初期化
+    vault_name = find_obsidian_vault_name(WATCH_ROOT)
+    is_open = is_obsidian_vault_window_open(vault_name)
+    attached = is_open
+
+    # 起動通知（案B: 書庫が開いていない場合も通知）
+    if attached:
+        send_windows_toast(
+            "gather-md 起動",
+            f"監視を開始しました ({WATCH_ROOT.name}) / Obsidian ({vault_name}) と連動中",
+        )
+        print(f"[情報] 対象のObsidian書庫 ({vault_name}) を検出しました。連動を開始します。", flush=True)
+    else:
+        send_windows_toast(
+            "gather-md 起動",
+            f"監視を開始しました ({WATCH_ROOT.name})。Obsidian ({vault_name}) の起動を待機中",
+        )
+        print(f"[情報] 対象のObsidian書庫 ({vault_name}) は現在開かれていません。起動を待機します...", flush=True)
+
+    # 3. 起動時に配下の全プロジェクトを検出して初回ビルドを実行
     projects = find_all_projects()
     if projects:
         print(f"\n{len(projects)} 件のプロジェクト定義を検出しました:", flush=True)
@@ -624,14 +833,61 @@ def main():
     observer.schedule(event_handler, path=str(WATCH_ROOT), recursive=True)
     observer.start()
 
+    disappear_count = 0
+    obsidian_check_counter = 0
+
     try:
         while True:
             time.sleep(1)
+            obsidian_check_counter += 1
+
+            # 約2秒ごとに対象Obsidian書庫のウィンドウ状態をチェック
+            if obsidian_check_counter >= 2:
+                obsidian_check_counter = 0
+                is_currently_open = is_obsidian_vault_window_open(vault_name)
+
+                if not attached:
+                    # 待機中にObsidian（対象書庫）が開かれた場合
+                    if is_currently_open:
+                        attached = True
+                        disappear_count = 0
+                        send_windows_toast(
+                            "gather-md 連動開始",
+                            f"Obsidian ({vault_name}) を検出しました。終了監視を開始します。",
+                        )
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] [情報] Obsidian ({vault_name}) の起動を検知しました。終了連動を有効化します。",
+                            flush=True,
+                        )
+                else:
+                    # 連動中に対象書庫が閉じられたか判定
+                    if not is_currently_open:
+                        disappear_count += 1
+                        # 一時的なリロード等による誤検知を防ぐため連続2回（約4秒）未検出で終了
+                        if disappear_count >= 2:
+                            send_windows_toast(
+                                "gather-md 停止",
+                                f"Obsidian ({vault_name}) の終了を検知したため停止しました。",
+                            )
+                            print(
+                                f"\n[{time.strftime('%H:%M:%S')}] [情報] Obsidian ({vault_name}) の終了を検知しました。プログラムを自動終了します。",
+                                flush=True,
+                            )
+                            break
+                    else:
+                        disappear_count = 0
+
     except KeyboardInterrupt:
         print("\n監視を停止しています...", flush=True)
+        send_windows_toast("gather-md 停止", f"監視を終了しました ({WATCH_ROOT.name})。")
+    except Exception as e:
+        print(f"\n[致命的エラー] {e}", file=sys.stderr, flush=True)
+        send_windows_toast("gather-md エラー", f"予期せぬエラーにより停止しました: {e}")
+    finally:
         observer.stop()
-    observer.join()
-    print("終了しました。", flush=True)
+        observer.join()
+        instance_lock.release()
+        print("終了しました。", flush=True)
 
 
 if __name__ == "__main__":
