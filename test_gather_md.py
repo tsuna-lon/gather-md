@@ -26,6 +26,7 @@ from gather_md import (
     send_windows_toast,
     find_obsidian_vault_name,
     is_obsidian_vault_window_open,
+    clean_block_text,
 )
 
 
@@ -662,6 +663,80 @@ template: |
             send_windows_toast("テストタイトル", "テストメッセージ")
         except Exception as e:
             self.fail(f"send_windows_toast raised an unexpected exception: {e}")
+
+    def test_clean_block_text_preserves_indent_and_fullwidth_space(self):
+        """clean_block_text が先頭の全角スペースや字下げインデントを保持し、余計な空行のみを除去すること"""
+        # 1. 先頭が全角スペース（段落初めの字下げ）
+        self.assertEqual(clean_block_text("　段落の開始です。"), "　段落の開始です。")
+
+        # 2. 先頭に空行があり、その後に全角スペース
+        self.assertEqual(
+            clean_block_text("\n\n　第1段落です。\n\n　第2段落です。\n\n"),
+            "　第1段落です。\n\n　第2段落です。",
+        )
+
+        # 3. 半角スペースによる字下げインデント
+        self.assertEqual(clean_block_text("  インデント行"), "  インデント行")
+        self.assertEqual(clean_block_text("    4文字インデント"), "    4文字インデント")
+
+        # 4. 空白のみの空行が先頭にある場合
+        self.assertEqual(clean_block_text("   \n　本文です。"), "　本文です。")
+
+        # 5. 空白・改行のみのブロック
+        self.assertEqual(clean_block_text(""), "")
+        self.assertEqual(clean_block_text("   \n  \t  \n"), "")
+        self.assertEqual(clean_block_text("　"), "")
+
+    def test_preserve_leading_whitespace_in_report_output(self):
+        """完成レポート生成時に、段落頭の全角スペースやインデントがそのまま維持されて出力されること"""
+        proj_dir = self.test_dir / "project_whitespace"
+        proj_dir.mkdir()
+        config_path = proj_dir / "_template.md"
+        config_path.write_text(
+            """---
+output: "_完成レポート.md"
+warning_banner: false
+---
+# 論文レポート
+{{intro}}
+
+<!-- INSERT:body -->
+<!-- END:body -->
+""",
+            encoding="utf-8",
+        )
+
+        draft = proj_dir / "draft.md"
+        draft.write_text(
+            """
+```report: intro
+　本研究の目的は、AIによる文章作成支援の有用性を検証することである。
+　第1節では背景を述べる。
+```
+
+```report: body
+　具体的には以下の検証を行った。
+    - 項目1（インデント付き）
+    - 項目2
+```
+""",
+            encoding="utf-8",
+        )
+
+        cfg = load_project_config(proj_dir)
+        self.assertIsNotNone(cfg)
+        self.assertTrue(generate_report(cfg))
+
+        report_content = cfg.output_file.read_text(encoding="utf-8")
+
+        # Mustache形式での全角スペース保持確認
+        self.assertIn("　本研究の目的は、AIによる文章作成支援の有用性を検証することである。", report_content)
+        self.assertIn("　第1節では背景を述べる。", report_content)
+
+        # コメント形式での全角スペースおよびインデント保持確認
+        self.assertIn("　具体的には以下の検証を行った。", report_content)
+        self.assertIn("    - 項目1（インデント付き）", report_content)
+
 
 
 if __name__ == "__main__":

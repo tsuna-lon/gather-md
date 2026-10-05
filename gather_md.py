@@ -487,6 +487,21 @@ def create_default_template_if_needed(dir_path: Path, root_dir: Path = WATCH_ROO
         return None
 
 
+def clean_block_text(text: str) -> str:
+    """
+    コードブロックから抽出した本文の前後の余分な空行・空白を除去する。
+    - 先頭の空行（改行のみ、または空白のみの行）を除去。
+    - ただし、本文先頭行の行頭空白（全角スペースや字下げインデント）は保持する。
+    - 末尾の余分な空白・改行を除去する。
+    """
+    if not text:
+        return ""
+    # 先頭の空行を除去（本文最初の行頭にある全角スペースやインデントは残す）
+    cleaned = re.sub(r"^(?:[ \t\u3000]*\r?\n)+", "", text)
+    # 末尾の空白・改行を除去
+    return cleaned.rstrip()
+
+
 def extract_blocks(project_dir: Path, exclude_paths: set[Path]) -> dict[str, str]:
     """プロジェクトディレクトリ配下の全マークダウンファイルからブロックを抽出する。"""
     blocks: dict[str, str] = {}
@@ -510,7 +525,7 @@ def extract_blocks(project_dir: Path, exclude_paths: set[Path]) -> dict[str, str
                 tag_clean = tag.strip()
                 if tag_clean in blocks:
                     print(f"  [注意] タグ '{tag_clean}' が重複しています ({md_file.name} で上書き)", flush=True)
-                blocks[tag_clean] = (text or "").strip()
+                blocks[tag_clean] = clean_block_text(text)
         except Exception as e:
             print(f"  [警告] ファイル読み込みスキップ ({md_file.name}): {e}", flush=True)
             continue
