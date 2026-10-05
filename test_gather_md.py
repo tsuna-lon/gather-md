@@ -27,6 +27,8 @@ from gather_md import (
     find_obsidian_vault_name,
     is_obsidian_vault_window_open,
     clean_block_text,
+    wrap_template_with_code_block,
+    get_code_block_fence,
 )
 
 
@@ -737,8 +739,155 @@ warning_banner: false
         self.assertIn("　具体的には以下の検証を行った。", report_content)
         self.assertIn("    - 項目1（インデント付き）", report_content)
 
+    def test_code_block_auto_wrap_and_separation(self):
+        """code_block: true で本文がコードブロック化され、見出し・警告バナー・フッターが表示分離されること"""
+        proj_dir = self.test_dir / "project_codeblock_separation"
+        proj_dir.mkdir()
+        config_path = proj_dir / "_template.md"
+        config_path.write_text(
+            """---
+output: "_完成レポート.md"
+warning_banner: true
+code_block: true
+---
+# 研究レポート
+
+{{chap1}}
+
+{{chap2}}
+
+---
+文字数: {{char_count}} 字（空白含: {{char_count_with_spaces}} 字）
+""",
+            encoding="utf-8",
+        )
+
+        draft = proj_dir / "draft.md"
+        draft.write_text(
+            """
+```report: chap1
+　第1章の段落です。全角スペースで字下げしています。
+```
+
+```report: chap2
+　第2章の段落です。
+```
+""",
+            encoding="utf-8",
+        )
+
+        cfg = load_project_config(proj_dir)
+        self.assertIsNotNone(cfg)
+        self.assertTrue(cfg.code_block)
+        self.assertTrue(generate_report(cfg))
+
+        content = cfg.output_file.read_text(encoding="utf-8")
+
+        # 1. 警告バナーが最先頭に存在し、コードブロックの外側にあること
+        self.assertTrue(content.startswith(WARNING_BANNER))
+
+        # 2. 見出し (# 研究レポート) がコードブロックの外側（バナーとコードブロックの間）にあること
+        banner_end_idx = len(WARNING_BANNER)
+        code_fence_idx = content.find("```text")
+        self.assertGreater(code_fence_idx, banner_end_idx)
+        heading_idx = content.find("# 研究レポート")
+        self.assertGreaterEqual(heading_idx, banner_end_idx)
+        self.assertLess(heading_idx, code_fence_idx)
+
+        # 3. 本文が ```text ... ``` の内側に収まっていること
+        code_fence_end_idx = content.find("```", code_fence_idx + 7)
+        self.assertGreater(code_fence_end_idx, -1)
+        code_body = content[code_fence_idx:code_fence_end_idx]
+        self.assertIn("　第1章の段落です。全角スペースで字下げしています。", code_body)
+        self.assertIn("　第2章の段落です。", code_body)
+
+        # 4. 水平線 (---) および文字数フッターがコードブロック終了フェンスの後にあること
+        footer_idx = content.find("文字数:")
+        self.assertGreater(footer_idx, code_fence_end_idx)
+
+    def test_backticks_and_codeblocks_excluded_from_character_counts(self):
+        """コードブロック開始・終了行およびバッククォート記号が文字数集計から完全に除外されること"""
+        # 1. calculate_character_counts 単体での検証
+        # コードブロック行 ```text と ```、インラインバッククォート `code` の検証
+        raw_text = "```text\nこれはテスト本文です。\n```\n`重要`キーワード"
+        # 純文字数: "これはテスト本文です。" (10) + "重要キーワード" (8) = 18文字
+        no_spaces, with_spaces = calculate_character_counts(raw_text)
+        self.assertEqual(no_spaces, 18)
+        self.assertEqual(with_spaces, 18)
+
+        # 2. レポート全体での検証: 通常モード (code_block: false) とコードブロックモード (code_block: true)
+        proj_normal = self.test_dir / "proj_normal"
+        proj_normal.mkdir()
+        (proj_normal / "draft.md").write_text("```report: body\nこれはテスト本文です。\n```", encoding="utf-8")
+        (proj_normal / "_template.md").write_text(
+            """---
+output: "_完成レポート.md"
+warning_banner: false
+code_block: false
+---
+{{body}}
+文字数: {{char_count_raw}}
+""",
+            encoding="utf-8",
+        )
+
+        proj_cb = self.test_dir / "proj_cb"
+        proj_cb.mkdir()
+        (proj_cb / "draft.md").write_text("```report: body\nこれはテスト本文です。\n```", encoding="utf-8")
+        (proj_cb / "_template.md").write_text(
+            """---
+output: "_完成レポート.md"
+warning_banner: false
+code_block: true
+---
+{{body}}
+文字数: {{char_count_raw}}
+""",
+            encoding="utf-8",
+        )
+
+        cfg_normal = load_project_config(proj_normal)
+        self.assertTrue(generate_report(cfg_normal))
+
+        cfg_cb = load_project_config(proj_cb)
+        self.assertTrue(generate_report(cfg_cb))
+
+        content_normal = cfg_normal.output_file.read_text(encoding="utf-8")
+        content_cb = cfg_cb.output_file.read_text(encoding="utf-8")
+
+        count_normal = int(re.search(r"文字数:\s*(\d+)", content_normal).group(1))
+        count_cb = int(re.search(r"文字数:\s*(\d+)", content_cb).group(1))
+
+        # コードブロック化しても ```text や ``` が除外され、通常モードと同一の集計結果になること
+        self.assertEqual(count_cb, count_normal)
+
+    def test_dynamic_fence_escape_for_embedded_backticks(self):
+        """本文・下書きブロックにバッククォートが含まれる場合の動的フェンス拡張テスト"""
+        # 単体関数でのフェンス判定テスト
+        self.assertEqual(get_code_block_fence("バッククォートなし"), "```")
+        self.assertEqual(get_code_block_fence("インライン `code` あり"), "```")
+        self.assertEqual(get_code_block_fence("3連 ```code``` あり"), "````")
+        self.assertEqual(get_code_block_fence("4連 ````code```` あり"), "`````")
+
+        # wrap_template_with_code_block で下書きに3連バッククォートがある場合
+        template = "# レポート\n{{body}}\n---\n文字数: {{char_count}}"
+        blocks = {"body": "インラインコードおよび ```コードブロック``` です。"}
+        wrapped = wrap_template_with_code_block(template, blocks)
+        self.assertIn("````text\n", wrapped)
+        self.assertIn("\n````", wrapped)
+
+    def test_no_double_wrapping_if_code_block_already_present(self):
+        """テンプレート内に既に手動でコードブロックが書かれている場合は二重ラップしないこと"""
+        template_text = """# タイトル
+```text
+{{sec}}
+```
+"""
+        wrapped = wrap_template_with_code_block(template_text)
+        self.assertEqual(wrapped, template_text)
 
 
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -65,6 +65,7 @@ output: "_完成レポート.md"
 readonly: false
 warning_banner: true
 auto_rollback: true
+code_block: false
 ---
 # {title} レポート
 
@@ -271,6 +272,7 @@ class ProjectConfig:
     readonly: bool = False
     warning_banner: bool = True
     auto_rollback: bool = True
+    code_block: bool = False
 
 
 def set_file_writable(file_path: Path) -> None:
@@ -320,6 +322,7 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                 readonly = data.get("readonly", False)
                 warning_banner = data.get("warning_banner", True)
                 auto_rollback = data.get("auto_rollback", True)
+                code_block = data.get("code_block", data.get("codeblock", False))
 
                 template_content = data.get("template")
                 template_file = None
@@ -347,6 +350,7 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                     readonly=bool(readonly),
                     warning_banner=bool(warning_banner),
                     auto_rollback=bool(auto_rollback),
+                    code_block=bool(code_block),
                 )
             except Exception as e:
                 print(f"[エラー] 設定ファイル読み込みエラー ({cfg_path}): {e}", flush=True)
@@ -365,6 +369,7 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                 readonly = frontmatter.get("readonly", False)
                 warning_banner = frontmatter.get("warning_banner", True)
                 auto_rollback = frontmatter.get("auto_rollback", True)
+                code_block = frontmatter.get("code_block", frontmatter.get("codeblock", False))
 
                 return ProjectConfig(
                     project_dir=dir_path.resolve(),
@@ -375,6 +380,7 @@ def load_project_config(dir_path: Path) -> ProjectConfig | None:
                     readonly=bool(readonly),
                     warning_banner=bool(warning_banner),
                     auto_rollback=bool(auto_rollback),
+                    code_block=bool(code_block),
                 )
             except Exception as e:
                 print(f"[エラー] テンプレートファイル読み込みエラー ({t_path}): {e}", flush=True)
@@ -533,25 +539,112 @@ def extract_blocks(project_dir: Path, exclude_paths: set[Path]) -> dict[str, str
     return blocks
 
 
+def get_code_block_fence(content: str, min_len: int = 3) -> str:
+    """contentに含まれるバッククォートの最大連続数+1（最低min_len）のフェンス文字列を返す。"""
+    matches = re.findall(r"`+", content)
+    max_len = max((len(m) for m in matches), default=0)
+    fence_len = max(min_len, max_len + 1)
+    return "`" * fence_len
+
+
+def wrap_template_with_code_block(template: str, blocks: dict[str, str] | None = None) -> str:
+    """
+    テンプレート内の本文（非char_countプレースホルダー群）をコードブロック (```text ... ```) で囲む。
+    - すでにテンプレート内にコードブロック（3連以上のバッククォート）が存在する場合は二重ラップを防ぐため何もしない。
+    - 下書きブロック本文やテンプレート内に含まれるバッククォートと衝突しないようフェンス長を動的に決定。
+    - 見出し（# タイトル等）やフッター（--- や char_count 等）はコードブロックの外側に保持する。
+    """
+    # 既にコードブロック（3連以上のバッククォート）が存在するかチェック
+    if re.search(r"^`{3,}", template, flags=re.MULTILINE):
+        return template
+
+    # 下書きテキストとテンプレート全体から最大バッククォート長を考慮してフェンス長を計算
+    combined_texts = template
+    if blocks:
+        combined_texts += "\n" + "\n".join(blocks.values())
+    fence = get_code_block_fence(combined_texts, min_len=3)
+
+    # 非char_countプレースホルダーを検索
+    placeholders: list[tuple[int, int]] = []
+    for m in MUSTACHE_PLACEHOLDER_PATTERN.finditer(template):
+        tag = m.group(1).strip().lower()
+        if tag not in ("char_count", "char_count_with_spaces", "char_count_raw"):
+            placeholders.append((m.start(), m.end()))
+
+    for m in COMMENT_PLACEHOLDER_PATTERN.finditer(template):
+        tag = m.group(1).strip().lower()
+        if tag not in ("char_count", "char_count_with_spaces", "char_count_raw"):
+            placeholders.append((m.start(), m.end()))
+
+    # プレースホルダーがない場合
+    if not placeholders:
+        sep_match = re.search(r"^---[ \t]*$", template, flags=re.MULTILINE)
+        if sep_match:
+            body = template[:sep_match.start()].rstrip("\r\n")
+            footer = template[sep_match.start():]
+            return f"{fence}text\n{body}\n{fence}\n\n{footer}"
+        else:
+            return f"{fence}text\n{template.strip()}\n{fence}\n"
+
+    first_start = min(p[0] for p in placeholders)
+    last_end = max(p[1] for p in placeholders)
+
+    # 1. プレースホルダーより前にある「見出し」をコードブロックの外に残す
+    prefix = template[:first_start]
+    heading_matches = list(re.finditer(r"^#+[^\r\n]*", prefix, flags=re.MULTILINE))
+    if heading_matches:
+        last_heading = heading_matches[-1]
+        split_pos = last_heading.end()
+        while split_pos < first_start and prefix[split_pos] in "\r\n":
+            split_pos += 1
+        before = template[:split_pos].rstrip("\r\n") + "\n\n"
+        code_content_start = split_pos
+    else:
+        before = ""
+        code_content_start = 0
+
+    # 2. プレースホルダーより後にある「フッター（水平線や文字数タグ）」をコードブロックの外に残す
+    suffix = template[last_end:]
+    footer_match = re.search(
+        r"(?:^[ \t]*---[ \t]*$|^[^\r\n]*?(?:\{\{\s*char_count|<!--\s*(?:INSERT:\s*)?char_count))",
+        suffix,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+    if footer_match:
+        split_end = last_end + footer_match.start()
+        middle = template[code_content_start:split_end].strip("\r\n")
+        after = "\n\n" + template[split_end:].lstrip("\r\n")
+    else:
+        middle = template[code_content_start:].strip("\r\n")
+        after = ""
+
+    return f"{before}{fence}text\n{middle}\n{fence}{after}"
+
+
 def calculate_character_counts(text: str) -> tuple[int, int]:
     """
     テキストの文字数を集計する。
     - コメントタグ（<!-- ... -->）および未作成・未記入ラベル（【未作成: ...】, 【未記入: ...】）は集計から除外。
+    - コードブロック開始行・終了行（```text, ``` 等）およびバッククォート文字は集計から除外。
     戻り値: (空白除外文字数, 空白含む文字数)
     """
-    # HTMLコメントタグを除去
+    # 1. HTMLコメントタグを除去
     no_comments = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-    # 未作成・未記入ラベルを除去
+    # 2. 未作成・未記入ラベルを除去
     no_labels = re.sub(r"【(?:未作成|未記入):[^】\r\n]*?】", "", no_comments)
-    # 改行コードを正規化
+    # 3. 改行コードを正規化
     normalized = no_labels.replace("\r\n", "\n")
+    # 4. コードブロック境界行（```text や ``` 等）を行ごと除去
+    no_fences = re.sub(r"^[ \t]*`{3,}[^\n]*$", "", normalized, flags=re.MULTILINE)
+    # 5. 残ったバッククォート記号自体を除去
+    clean_text = no_fences.replace("`", "")
 
     # 空白・改行をすべて除外した純文字数
-    no_spaces = re.sub(r"\s+", "", normalized)
+    no_spaces = re.sub(r"\s+", "", clean_text)
     count_no_spaces = len(no_spaces)
 
     # 改行のみ除外した文字数（空白を含む）
-    with_spaces = normalized.replace("\n", "")
+    with_spaces = clean_text.replace("\n", "")
     count_with_spaces = len(with_spaces)
 
     return count_no_spaces, count_with_spaces
@@ -569,6 +662,10 @@ def build_report_content(config: ProjectConfig) -> tuple[str, int, int] | None:
     template = config.template_content
     if not template:
         return None
+
+    # code_block 設定が有効な場合、テンプレートの本文部分を自動的にコードブロック化
+    if config.code_block:
+        template = wrap_template_with_code_block(template, blocks)
 
     # 2. HTMLコメント形式のプレースホルダー置換
     # <!-- INSERT:tag --> または <!-- INSERT:tag -->...<!-- END:tag -->
