@@ -886,6 +886,134 @@ code_block: true
         wrapped = wrap_template_with_code_block(template_text)
         self.assertEqual(wrapped, template_text)
 
+    def test_char_count_excludes_content_below_tag(self):
+        """文字数タグより下のコンテンツ（参考文献等）が集計から除外され、直前の水平線も除外されること"""
+        proj_dir = self.test_dir / "proj_below_exclude"
+        proj_dir.mkdir()
+        (proj_dir / "draft.md").write_text("```report: body\nこれは本文です。\n```", encoding="utf-8")
+        (proj_dir / "_template.md").write_text(
+            """---
+output: "_完成レポート.md"
+warning_banner: false
+code_block: false
+---
+# タイトル
+{{body}}
+
+---
+文字数: {{char_count_raw}}
+
+## 参考文献
+1. 参考文献A
+2. 参考文献B
+""",
+            encoding="utf-8",
+        )
+        cfg = load_project_config(proj_dir)
+        self.assertTrue(generate_report(cfg))
+        content = cfg.output_file.read_text(encoding="utf-8")
+
+        # 集計対象: "# タイトル" (5文字) + "これは本文です。" (8文字) = 13文字
+        # 水平線 "---" (3文字) や 参考文献リストは含まれない
+        count_match = re.search(r"文字数:\s*(\d+)", content)
+        self.assertIsNotNone(count_match)
+        self.assertEqual(int(count_match.group(1)), 13)
+
+    def test_char_count_multiple_tags_on_same_line(self):
+        """同一行に複数の文字数タグがある場合、両方が同一行より上の行を正しく集計すること"""
+        proj_dir = self.test_dir / "proj_same_line"
+        proj_dir.mkdir()
+        (proj_dir / "draft.md").write_text("```report: body\nあいうえお　かきくけこ\n```", encoding="utf-8")
+        (proj_dir / "_template.md").write_text(
+            """---
+output: "_完成レポート.md"
+warning_banner: false
+code_block: false
+---
+{{body}}
+文字数: {{char_count}} 字（空白含: {{char_count_with_spaces}} 字）
+""",
+            encoding="utf-8",
+        )
+        cfg = load_project_config(proj_dir)
+        self.assertTrue(generate_report(cfg))
+        content = cfg.output_file.read_text(encoding="utf-8")
+
+        # "あいうえお　かきくけこ": 純文字数 10文字, 空白含む 11文字（全角スペース1個）
+        self.assertIn("文字数: 10 字（空白含: 11 字）", content)
+
+    def test_char_count_intermediate_counts(self):
+        """複数箇所に文字数タグがある場合、各地点までの文字数が正しく算出され前の文字数タグ行が混入しないこと"""
+        proj_dir = self.test_dir / "proj_intermediate"
+        proj_dir.mkdir()
+        (proj_dir / "draft.md").write_text(
+            """```report: chap1
+あいうえお
+```
+```report: chap2
+かきくけこ
+```
+""",
+            encoding="utf-8",
+        )
+        (proj_dir / "_template.md").write_text(
+            """---
+output: "_完成レポート.md"
+warning_banner: false
+code_block: false
+---
+# 第1章
+{{chap1}}
+
+第1章文字数: {{char_count_raw}}
+
+# 第2章
+{{chap2}}
+
+第2章までの合計文字数: {{char_count_raw}}
+""",
+            encoding="utf-8",
+        )
+        cfg = load_project_config(proj_dir)
+        self.assertTrue(generate_report(cfg))
+        content = cfg.output_file.read_text(encoding="utf-8")
+
+        # 第1章: "# 第1章" (4文字) + "あいうえお" (5文字) = 9文字
+        # 第2章まで: "# 第1章" (4) + "あいうえお" (5) + "# 第2章" (4) + "かきくけこ" (5) = 18文字
+        # "第1章文字数: 9" という行自体は除外されて合計に混ざらないこと
+        self.assertIn("第1章文字数: 9", content)
+        self.assertIn("第2章までの合計文字数: 18", content)
+
+    def test_char_count_html_comments(self):
+        """HTMLコメント形式の文字数タグでもその地点より上のテキストが集計されること"""
+        proj_dir = self.test_dir / "proj_html_comment"
+        proj_dir.mkdir()
+        (proj_dir / "draft.md").write_text("```report: body\nテスト本文\n```", encoding="utf-8")
+        (proj_dir / "_template.md").write_text(
+            """---
+output: "_完成レポート.md"
+warning_banner: false
+code_block: false
+---
+{{body}}
+
+<!-- CHAR_COUNT -->
+<!-- CHAR_COUNT_WITH_SPACES -->
+<!-- INSERT:char_count --><!-- END:char_count -->
+
+## 下部テキスト（除外対象）
+不要な文章
+""",
+            encoding="utf-8",
+        )
+        cfg = load_project_config(proj_dir)
+        self.assertTrue(generate_report(cfg))
+        content = cfg.output_file.read_text(encoding="utf-8")
+
+        # "テスト本文" = 5文字
+        self.assertIn("\n5\n", content)
+        self.assertNotIn("14", content)  # 不要な文章等が含まれると文字数が増える
+
 
 if __name__ == "__main__":
     unittest.main()

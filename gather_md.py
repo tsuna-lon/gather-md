@@ -52,6 +52,14 @@ COMMENT_PLACEHOLDER_PATTERN = re.compile(
 # Mustache置換パターン: {{tag}} (改行や波括弧を含まない任意の文字列)
 MUSTACHE_PLACEHOLDER_PATTERN = re.compile(r"\{\{([^\{\}\r\n]+?)\}\}")
 
+# 文字数カウントプレースホルダー判定用正規表現
+CHAR_COUNT_TAG_PATTERN = re.compile(
+    r"\{\{\s*(?:char_count|char_count_with_spaces|char_count_raw)\s*\}\}|"
+    r"<!--\s*INSERT:\s*char_count\s*-->(?:.*?<!--\s*END:\s*char_count\s*-->)?|"
+    r"<!--\s*(?:CHAR_COUNT|CHAR_COUNT_WITH_SPACES)\s*-->",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # 誤編集防止用警告バナー（Obsidian Callout記法対応）
 WARNING_BANNER = (
     "> [!CAUTION]\n"
@@ -650,6 +658,38 @@ def calculate_character_counts(text: str) -> tuple[int, int]:
     return count_no_spaces, count_with_spaces
 
 
+def get_target_text_for_char_count(lines: list[str], current_line_idx: int, char_count_line_indices: set[int]) -> str:
+    """文字数タグ行より上のテキストから、他の文字数タグ行や直前の水平線・空行を除いた集計対象テキストを取得する。"""
+    filtered_lines = [
+        line for idx, line in enumerate(lines[:current_line_idx])
+        if idx not in char_count_line_indices
+    ]
+    # 直前の水平線（--- 等）および空行をフッター境界とみなして末尾から除去
+    while filtered_lines:
+        last = filtered_lines[-1].strip()
+        if not last or re.match(r"^[-*_]{3,}$", last):
+            filtered_lines.pop()
+        else:
+            break
+    return "".join(filtered_lines)
+
+
+def replace_char_count_tags_in_line(line: str, count_no_spaces: int, count_with_spaces: int) -> str:
+    """1行に含まれる文字数プレースホルダーを対応する数値で置換する。"""
+    line = re.sub(r"\{\{\s*char_count\s*\}\}", f"{count_no_spaces:,}", line, flags=re.IGNORECASE)
+    line = re.sub(r"\{\{\s*char_count_with_spaces\s*\}\}", f"{count_with_spaces:,}", line, flags=re.IGNORECASE)
+    line = re.sub(r"\{\{\s*char_count_raw\s*\}\}", str(count_no_spaces), line, flags=re.IGNORECASE)
+    line = re.sub(
+        r"<!--\s*INSERT:\s*char_count\s*-->(?:.*?<!--\s*END:\s*char_count\s*-->)?",
+        f"{count_no_spaces:,}",
+        line,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    line = re.sub(r"<!--\s*CHAR_COUNT\s*-->", f"{count_no_spaces:,}", line, flags=re.IGNORECASE)
+    line = re.sub(r"<!--\s*CHAR_COUNT_WITH_SPACES\s*-->", f"{count_with_spaces:,}", line, flags=re.IGNORECASE)
+    return line
+
+
 def build_report_content(config: ProjectConfig) -> tuple[str, int, int] | None:
     """テンプレートと下書きブロックから完成レポートの内容と文字数を生成する。"""
     exclude_paths = {config.output_file.resolve(), config.config_file.resolve()}
@@ -701,23 +741,36 @@ def build_report_content(config: ProjectConfig) -> tuple[str, int, int] | None:
 
     merged = MUSTACHE_PLACEHOLDER_PATTERN.sub(replace_mustache, merged)
 
-    # 4. 文字数カウント集計と置換
-    count_no_spaces, count_with_spaces = calculate_character_counts(merged)
+    # 4. 文字数カウント集計と置換（タグが存在する行より上の行全体を集計対象とする）
+    lines = merged.splitlines(keepends=True)
+    char_count_line_indices = {
+        i for i, line in enumerate(lines) if CHAR_COUNT_TAG_PATTERN.search(line)
+    }
 
-    # 特殊タグ置換
-    merged = re.sub(r"\{\{char_count\}\}", f"{count_no_spaces:,}", merged)
-    merged = re.sub(r"\{\{char_count_with_spaces\}\}", f"{count_with_spaces:,}", merged)
-    merged = re.sub(r"\{\{char_count_raw\}\}", str(count_no_spaces), merged)
+    last_count_no_spaces = 0
+    last_count_with_spaces = 0
 
-    merged = re.sub(r"<!--\s*INSERT:\s*char_count\s*-->(?:.*?<!--\s*END:\s*char_count\s*-->)?", f"{count_no_spaces:,}", merged, flags=re.DOTALL)
-    merged = re.sub(r"<!--\s*CHAR_COUNT\s*-->", f"{count_no_spaces:,}", merged)
-    merged = re.sub(r"<!--\s*CHAR_COUNT_WITH_SPACES\s*-->", f"{count_with_spaces:,}", merged)
+    if char_count_line_indices:
+        new_lines = []
+        for i, line in enumerate(lines):
+            if i in char_count_line_indices:
+                target_text = get_target_text_for_char_count(lines, i, char_count_line_indices)
+                cnt_no_spaces, cnt_with_spaces = calculate_character_counts(target_text)
+                last_count_no_spaces = cnt_no_spaces
+                last_count_with_spaces = cnt_with_spaces
+                new_line = replace_char_count_tags_in_line(line, cnt_no_spaces, cnt_with_spaces)
+                new_lines.append(new_line)
+            else:
+                new_lines.append(line)
+        merged = "".join(new_lines)
+    else:
+        last_count_no_spaces, last_count_with_spaces = calculate_character_counts(merged)
 
     # 5. 誤編集防止警告バナーの挿入（文字数カウント集計の後に付与し、集計対象から除外）
     if config.warning_banner:
         merged = WARNING_BANNER + merged
 
-    return merged, count_no_spaces, count_with_spaces
+    return merged, last_count_no_spaces, last_count_with_spaces
 
 
 def generate_report(config: ProjectConfig) -> bool:
